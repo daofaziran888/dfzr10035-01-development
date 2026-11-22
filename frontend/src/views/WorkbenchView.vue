@@ -6,6 +6,14 @@
         <p class="page-desc">{{ meta.desc }}</p>
       </div>
       <div class="page-actions">
+        <RouterLink
+          v-if="meta.key === 'request_batch' || meta.key === 'retry_queue'"
+          class="btn"
+          data-testid="open-handover"
+          to="/request_batch/handover"
+        >
+          交接分布视图
+        </RouterLink>
         <button class="btn primary" data-testid="open-create" type="button" @click="openCreate">
           登记{{ meta.entity }}
         </button>

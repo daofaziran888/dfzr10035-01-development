@@ -1,7 +1,10 @@
 """重放队列领域服务：管理失败请求重试，与 request_batch、call_log、api_monitor 联动。"""
 from __future__ import annotations
 
+from datetime import datetime
+
 from app.services.base import BaseModuleService
+from app.services.batch_handover import ACTIVE_TASK_STATUS, BatchHandoverService
 from app.store import store
 
 
@@ -16,20 +19,108 @@ class RetryQueueService(BaseModuleService):
     NEGATIVE_ACTIONS = []
 
     def run_action(self, entry_id: int, action: str):
-        """重试中/已成功时联动写调用日志和更新监控；永久失败时触发告警。"""
+        """重试中/已成功时联动写调用日志和更新监控；永久失败时触发告警。
+
+        关联了交接请求的任务，取单前先问交接清单：已确认成功或已跳过的本轮不再取单。
+        """
+        if action in ("加入队列", "手动重试"):
+            task = store.find(self.MODULE, entry_id)
+            if task is not None:
+                block = self._handover_block_reason(task)
+                if block:
+                    return None, block
         entry, message = super().run_action(entry_id, action)
         if entry is None:
             return entry, message
+        handover = BatchHandoverService()
         if action == "加入队列":
             self._log_retry_start(entry)
         elif action == "手动重试":
             self._log_retry_success(entry)
+            receipt = handover.sync_replay_outcome(entry, success=True)
             self._update_monitor_health(entry)
             message += "，已更新调用日志和监控健康上报"
+            if receipt is not None:
+                message += f"，重放回执 {receipt['回执编号']} 已同步到交接清单"
         elif action == "标记失败":
+            receipt = handover.sync_replay_outcome(entry, success=False)
             self._trigger_alert(entry)
             message += "，已触发监控告警"
+            if receipt is not None:
+                message += f"，重放回执 {receipt['回执编号']} 已同步到交接清单"
         return entry, message
+
+    def _handover_block_reason(self, task: dict) -> str | None:
+        """交接清单已确认的请求，本轮取单直接拦下并说明依据回执。"""
+        code = str(task.get("关联请求编号", ""))
+        if not code:
+            return None
+        handover = BatchHandoverService()
+        req = handover.find_request_by_code(code)
+        if req is None:
+            return None
+        state = handover.request_state(req)
+        if state == "成功":
+            return (f"交接清单已凭回执 {req.get('确认回执', '')} 确认 {code} 成功，"
+                    f"任务 {task.get('任务编号', '')} 本轮不再取单")
+        if state == "已跳过":
+            return f"交接清单已标记 {code} 跳过补采，任务 {task.get('任务编号', '')} 本轮不再取单"
+        return None
+
+    def current_round(self) -> dict:
+        """本轮取单视图：可取单、被交接结果跳过、以及已确认请求清单。
+
+        补采中断后续做时，已确认的请求在这里依然查得见（含确认所用回执）。
+        """
+        handover = BatchHandoverService()
+        take, skip = [], []
+        for task in store.rows(self.MODULE):
+            if task.get("status") not in ACTIVE_TASK_STATUS:
+                continue
+            code = str(task.get("关联请求编号", ""))
+            req = handover.find_request_by_code(code) if code else None
+            base = {
+                "任务编号": task.get("任务编号", ""),
+                "失败端点": task.get("失败端点", ""),
+                "队列状态": task.get("队列状态", ""),
+                "关联请求编号": code or "—",
+            }
+            if req is None:
+                take.append({**base, "交接状态": "无交接关联"})
+                continue
+            state = handover.request_state(req)
+            if state == "成功":
+                skip.append({
+                    **base,
+                    "交接状态": state,
+                    "依据回执": req.get("确认回执", ""),
+                    "原因": f"交接已凭回执 {req.get('确认回执', '')} 确认成功，本轮不再取单",
+                })
+            elif state == "已跳过":
+                skip.append({
+                    **base,
+                    "交接状态": state,
+                    "依据回执": req.get("处置回执", ""),
+                    "原因": "值班员已标记跳过补采",
+                })
+            else:
+                take.append({**base, "交接状态": state})
+        confirmed = [
+            {
+                "请求编号": req.get("请求编号", ""),
+                "批次编号": req.get("批次编号", ""),
+                "当前结果": handover.request_state(req),
+                "确认回执": req.get("确认回执", "") or req.get("处置回执", ""),
+            }
+            for req in handover.list_requests()
+            if handover.request_state(req) in ("成功", "已跳过")
+        ]
+        return {
+            "取单时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "本轮可取": take,
+            "本轮跳过": skip,
+            "已确认请求": confirmed,
+        }
 
     def _log_retry_start(self, task: dict):
         log_rows = store.rows("call_log")
